@@ -1,0 +1,77 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build little core app",
+            "type": "shell",
+            "command": "/home/ubuntu/k230_sdk/toolchain/Xuantie-900-gcc-linux-5.10.4-glibc-x86_64-V2.6.0/bin/riscv64-unknown-linux-gnu-gcc",
+            "args": [
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-D_FILE_OFFSET_BITS=64",
+                "-I${workspaceFolder}",
+                "-I/home/ubuntu/k230_sdk/src/common/cdk/user/component/datafifo/include",
+                "-I/home/ubuntu/k230_sdk/src/big/mpp/include",
+                "-o",
+                "rtsp_sender_withsd",
+                "RTSP_Create.c",
+                "rtsp.c",
+                "rtp.c",
+                "file.c",
+                "nalu_datafifo.c",
+                "snapshot_writer.c",
+                "-L/home/ubuntu/k230_sdk/src/common/cdk/user/component/datafifo/slave/lib",
+                "-ldatafifo",
+                "-lpthread"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "build rt-smart app",
+            "type": "shell",
+            "command": "/home/ubuntu/k230_sdk/toolchain/riscv64-linux-musleabi_for_x86_64-pc-linux-gnu/bin/riscv64-unknown-linux-musl-gcc",
+            "args": [
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-DUSE_RT_SMART",
+                "-mcmodel=medany",
+                "-march=rv64imafdcv",
+                "-mabi=lp64d",
+                "-n",
+                "-static",
+                "-T",
+                "/home/ubuntu/k230_sdk/src/big/mpp/userapps/sample/linker_scripts/riscv64/link.lds",
+                "-I${workspaceFolder}",
+                "-I/home/ubuntu/k230_sdk/src/common/cdk/user/component/datafifo/include",
+                "-I/home/ubuntu/k230_sdk/src/big/mpp/include",
+                "-I/home/ubuntu/k230_sdk/src/big/mpp/include/comm",
+                "-I/home/ubuntu/k230_sdk/src/big/mpp/userapps/api",
+                "-o",
+                "rtsp_sender_rtsmart.elf",
+                "RTSP_Create.c",
+                "rtsp.c",
+                "rtp.c",
+                "file.c",
+                "nalu_datafifo.c",
+                "snapshot_writer.c",
+                "-L/home/ubuntu/k230_sdk/src/common/cdk/user/component/datafifo/host/lib",
+                "-L/home/ubuntu/k230_sdk/src/big/mpp/userapps/lib",
+                "-Wl,--start-group",
+                "-ldatafifo",
+                "-lsys",
+                "-Wl,--end-group",
+                "-lpthread"
+            ],
+            "group": "build",
+            "problemMatcher": "$gcc"
+        }
+    ]
+}
