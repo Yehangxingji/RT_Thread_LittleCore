@@ -18,8 +18,8 @@ static int send_all(int fd, const char *data)
 
     return 0;
 }
-
-static int parse_rtsp_request(const char *req, rtsp_request_t *out)
+// 解析RTSP请求
+staticstatic int parse_rtsp_request(const char *req, rtsp_request_t *out)
 {
     const char *cseq_pos;
 
@@ -43,7 +43,7 @@ static int parse_rtsp_request(const char *req, rtsp_request_t *out)
 
     return 0;
 }
-
+// 解析客户端端口
 static int parse_client_port(const char *req)
 {
     const char *p = strstr(req, "client_port=");
@@ -62,8 +62,8 @@ static int parse_client_port(const char *req)
 
     return port;
 }
-
-static void make_sdp(char *sdp, size_t maxlen, const char *control_url)
+// 生成SDP描述
+staticstatic void make_sdp(char *sdp, size_t maxlen, const char *control_url)
 {
     snprintf(sdp,
              maxlen,
@@ -80,8 +80,8 @@ static void make_sdp(char *sdp, size_t maxlen, const char *control_url)
              RTP_PAYLOAD_TYPE,
              control_url);
 }
-
-static void send_options_response(int fd, int cseq)
+// 发送OPTIONS响应
+staticstatic void send_options_response(int fd, int cseq)
 {
     char response[512];
 
@@ -95,8 +95,8 @@ static void send_options_response(int fd, int cseq)
 
     send_all(fd, response);
 }
-
-static void send_describe_response(int fd, const rtsp_request_t *req)
+// 发送DESCRIBE响应
+staticstatic void send_describe_response(int fd, const rtsp_request_t *req)
 {
     char sdp[1024];
     char response[2048];
@@ -187,7 +187,7 @@ static void send_error_response(int fd, int cseq, int code, const char *reason)
 
     send_all(fd, response);
 }
-
+// 处理RTSP客户端请求
 void handle_rtsp_client(int client_fd, const struct sockaddr_in *cli_addr)
 {
     char req_buf[2048];
@@ -282,26 +282,26 @@ int start_rtsp_server(void)
     int listen_fd;
     int opt = 1;
     struct sockaddr_in listen_addr;
-
+//  创建监听套接字
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         printf("RTSP socket failed, errno=%d\n", errno);
         return -1;
     }
-
+//  设置套接字选项，允许地址重用
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     memset(&listen_addr, 0, sizeof(listen_addr));
     listen_addr.sin_family = AF_INET;
     listen_addr.sin_port = htons(RTSP_PORT);
     listen_addr.sin_addr.s_addr = INADDR_ANY;
-
+//  绑定监听套接字到指定端口
     if (bind(listen_fd, (struct sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
         printf("RTSP bind port %d failed, errno=%d\n", RTSP_PORT, errno);
         close(listen_fd);
         return -1;
     }
-
+//  监听监听套接字
     if (listen(listen_fd, 5) < 0) {
         printf("RTSP listen failed, errno=%d\n", errno);
         close(listen_fd);

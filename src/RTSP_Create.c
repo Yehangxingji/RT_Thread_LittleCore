@@ -52,6 +52,12 @@ typedef struct {
     size_t len;
 } h265_param_set_cache_t;
 
+typedef struct {
+    datafifo_copied_frame_t frame;
+    uint8_t *storage;
+    size_t storage_len;
+} datafifo_owned_frame_t;
+
 pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
 
@@ -71,6 +77,8 @@ static h265_param_set_cache_t g_sps_cache;
 static h265_param_set_cache_t g_pps_cache;
 
 #define DATAFIFO_LOG_INTERVAL 30U
+
+static int h265_have_all_parameter_sets(void);
 
 static void print_usage(const char *prog)
 {
@@ -194,7 +202,7 @@ static int parse_args(int argc, char **argv)
     g_source = STREAM_SOURCE_FILE;
     return load_file_source(input_path);
 }
-
+// 获取RTSP目标地址
 static void get_rtsp_target(int *playing,
                             struct sockaddr_in *dest,
                             int *dest_valid,
@@ -211,7 +219,7 @@ static void get_rtsp_target(int *playing,
     }
     pthread_mutex_unlock(&g_mutex);
 }
-
+// 检查RTSP会话是否需要参数集
 static int rtsp_session_needs_parameter_sets(void)
 {
     int need;
@@ -273,40 +281,163 @@ static void datafifo_log_reader_idle(uint64_t last_seq,
     }
 }
 
-static void log_datafifo_stats(const mpp_nalu_ipc_msg *msg,
-                               int playing,
-                               unsigned int dropped_count,
-                               uint64_t last_seq,
-                               uint64_t send_cost_ms,
-                               unsigned int frame_count,
-                               int force)
+static void log_datafifo_frame_stats(uint64_t seq,
+                                     uint32_t pack_cnt,
+                                     uint32_t total_len,
+                                     uint64_t pts,
+                                     uint64_t submit_time_ms,
+                                     uint32_t flags,
+                                     int playing,
+                                     uint64_t last_seq,
+                                     uint64_t send_cost_ms,
+                                     unsigned int frame_count,
+                                     int force)
 {
     uint64_t seq_gap = 0;
 
-    if (msg == NULL) {
+    if (last_seq != 0 && seq > last_seq + 1ULL) {
+        seq_gap = seq - last_seq - 1ULL;
+    }
+
+    if (!force && seq_gap == 0 && (frame_count % DATAFIFO_LOG_INTERVAL) != 0) {
         return;
     }
 
-    if (last_seq != 0 && msg->seq > last_seq + 1ULL) {
-        seq_gap = msg->seq - last_seq - 1ULL;
-    }
-
-    if (!force && dropped_count == 0 && seq_gap == 0 &&
-        (frame_count % DATAFIFO_LOG_INTERVAL) != 0) {
-        return;
-    }
-
-    printf("[datafifo] seq=%llu drop=%u gap=%llu packs=%u total=%u pts=%llu submit=%llu send=%llums play=%d flags=0x%x\n",
-           (unsigned long long)msg->seq,
-           dropped_count,
+    printf("[datafifo] frame seq=%llu gap=%llu packs=%u total=%u pts=%llu submit=%llu send=%llums play=%d flags=0x%x\n",
+           (unsigned long long)seq,
            (unsigned long long)seq_gap,
-           msg->pack_cnt,
-           msg->total_len,
-           (unsigned long long)msg->frame_pts,
-           (unsigned long long)msg->submit_time_ms,
+           pack_cnt,
+           total_len,
+           (unsigned long long)pts,
+           (unsigned long long)submit_time_ms,
            (unsigned long long)send_cost_ms,
            playing,
-           msg->reserved);
+           flags);
+}
+
+static void datafifo_owned_frame_free(datafifo_owned_frame_t *owned)
+{
+    if (owned == NULL) {
+        return;
+    }
+
+    free(owned->storage);
+    memset(owned, 0, sizeof(*owned));
+}
+// 复制消息中的数据包到所有者帧中
+static int datafifo_copy_msg_packs(const mpp_nalu_ipc_msg *msg,
+                                   datafifo_owned_frame_t *owned)
+{
+    uint8_t *write_ptr;
+    size_t copy_len = 0;
+    k_u32 i;
+
+    if (msg == NULL || owned == NULL || msg->pack_cnt == 0 ||
+        msg->pack_cnt > MPP_NALU_IPC_MAX_PACKS) {
+        return -1;
+    }
+
+    for (i = 0; i < msg->pack_cnt; i++) {
+        copy_len += msg->packs[i].len;
+    }
+
+    if (copy_len == 0) {
+        return -1;
+    }
+
+    memset(owned, 0, sizeof(*owned));
+    owned->storage = (uint8_t *)malloc(copy_len);
+    if (owned->storage == NULL) {
+        printf("[datafifo] copy alloc failed seq=%llu total=%lu\n",
+               (unsigned long long)msg->seq,
+               (unsigned long)copy_len);
+        return -1;
+    }
+
+    owned->storage_len = copy_len;
+    owned->frame.chn = msg->chn;
+    owned->frame.pack_cnt = msg->pack_cnt;
+    owned->frame.seq = msg->seq;
+    owned->frame.frame_pts = msg->frame_pts;
+    owned->frame.submit_time_ms = msg->submit_time_ms;
+    owned->frame.total_len = (k_u32)copy_len;
+    owned->frame.reserved = msg->reserved;
+
+    write_ptr = owned->storage;
+    for (i = 0; i < msg->pack_cnt; i++) {
+        void *virt_addr;
+
+        virt_addr = nalu_datafifo_mmap_pack(&msg->packs[i]);
+        if (virt_addr == NULL) {
+            printf("[datafifo] copy mmap failed seq=%llu pack[%u] phys=0x%llx len=%u\n",
+                   (unsigned long long)msg->seq,
+                   i,
+                   (unsigned long long)msg->packs[i].phys_addr,
+                   msg->packs[i].len);
+            datafifo_owned_frame_free(owned);
+            return -1;
+        }
+
+        memcpy(write_ptr, virt_addr, msg->packs[i].len);
+        owned->frame.packs[i].data = write_ptr;
+        owned->frame.packs[i].len = msg->packs[i].len;
+        owned->frame.packs[i].pts = msg->packs[i].pts;
+        owned->frame.packs[i].type = msg->packs[i].type;
+        write_ptr += msg->packs[i].len;
+
+        if (nalu_datafifo_munmap_pack(&msg->packs[i], virt_addr) != 0) {
+            printf("[datafifo] copy munmap failed seq=%llu pack[%u] phys=0x%llx len=%u\n",
+                   (unsigned long long)msg->seq,
+                   i,
+                   (unsigned long long)msg->packs[i].phys_addr,
+                   msg->packs[i].len);
+            datafifo_owned_frame_free(owned);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int datafifo_should_copy_frame(int can_send,
+                                      int need_parameter_sets,
+                                      const mpp_nalu_ipc_msg *msg)
+{
+    if (msg == NULL) {
+        return 0;
+    }
+
+    return can_send ||
+           need_parameter_sets ||
+           !h265_have_all_parameter_sets() ||
+           ((msg->reserved & MPP_NALU_IPC_FLAG_SNAPSHOT) != 0);
+}
+
+static void log_datafifo_read_done(uint64_t seq,
+                                   uint64_t read_done_seq,
+                                   uint64_t read_done_fail_count,
+                                   int read_done_ret,
+                                   uint64_t copy_cost_ms,
+                                   uint64_t read_done_cost_ms,
+                                   uint64_t pre_done_cost_ms,
+                                   uint32_t total_len,
+                                   uint32_t flags,
+                                   int force)
+{
+    if (!force && read_done_ret == 0 && (read_done_seq % DATAFIFO_LOG_INTERVAL) != 0) {
+        return;
+    }
+
+    printf("[datafifo] read_done seq=%llu read_done_seq=%llu read_done_fail=%llu ret=%d copy=%llums read_done=%llums pre_done=%llums total=%u flags=0x%x\n",
+           (unsigned long long)seq,
+           (unsigned long long)read_done_seq,
+           (unsigned long long)read_done_fail_count,
+           read_done_ret,
+           (unsigned long long)copy_cost_ms,
+           (unsigned long long)read_done_cost_ms,
+           (unsigned long long)pre_done_cost_ms,
+           total_len,
+           flags);
 }
 
 static long h265_find_start_code_local(const uint8_t *buf,
@@ -624,54 +755,43 @@ static int datafifo_process_h265_buffer_for_playback(int sock,
     return 0;
 }
 
-static int datafifo_process_pack_for_playback(int sock,
-                                              const struct sockaddr_in *dest,
-                                              uint64_t datafifo_seq,
-                                              k_u32 pack_index,
-                                              const mpp_nalu_ipc_pack *pack,
-                                              uint16_t *seq,
-                                              uint32_t timestamp,
-                                              uint32_t ssrc,
-                                              uint8_t marker,
-                                              int can_send,
-                                              int *wait_for_idr)
+static int datafifo_process_copied_frame_for_playback(int sock,
+                                                      const struct sockaddr_in *dest,
+                                                      const datafifo_copied_frame_t *frame,
+                                                      uint16_t *seq,
+                                                      uint32_t timestamp,
+                                                      uint32_t ssrc,
+                                                      int can_send,
+                                                      int *wait_for_idr)
 {
-    void *virt_addr;
-    int ret;
+    k_u32 i;
 
-    virt_addr = nalu_datafifo_mmap_pack(pack);
-    if (virt_addr == NULL) {
-        printf("[datafifo] seq=%llu pack[%u] mmap failed phys=0x%llx len=%u\n",
-               (unsigned long long)datafifo_seq,
-               (unsigned int)pack_index,
-               pack ? (unsigned long long)pack->phys_addr : 0ULL,
-               pack ? pack->len : 0U);
+    if (frame == NULL) {
         return -1;
     }
 
-    ret = datafifo_process_h265_buffer_for_playback(sock,
-                                                    dest,
-                                                    (const uint8_t *)virt_addr,
-                                                    pack->len,
-                                                    seq,
-                                                    timestamp,
-                                                    ssrc,
-                                                    marker,
-                                                    can_send,
-                                                    wait_for_idr);
+    for (i = 0; i < frame->pack_cnt; i++) {
+        uint8_t marker = (i + 1U == frame->pack_cnt) ? 1 : 0;
 
-    if (nalu_datafifo_munmap_pack(pack, virt_addr) != 0) {
-        printf("[datafifo] seq=%llu pack[%u] munmap failed phys=0x%llx len=%u\n",
-               (unsigned long long)datafifo_seq,
-               (unsigned int)pack_index,
-               pack ? (unsigned long long)pack->phys_addr : 0ULL,
-               pack ? pack->len : 0U);
-        if (ret == 0) {
-            ret = -1;
+        if (datafifo_process_h265_buffer_for_playback(sock,
+                                                      dest,
+                                                      frame->packs[i].data,
+                                                      frame->packs[i].len,
+                                                      seq,
+                                                      timestamp,
+                                                      ssrc,
+                                                      marker,
+                                                      can_send,
+                                                      wait_for_idr) != 0) {
+            printf("[datafifo] process copied pack[%u] failed seq=%llu len=%lu\n",
+                   i,
+                   (unsigned long long)frame->seq,
+                   (unsigned long)frame->packs[i].len);
+            return -1;
         }
     }
 
-    return ret;
+    return 0;
 }
 
 
@@ -743,6 +863,8 @@ static void *datafifo_rtp_sender_loop(int sock)
     unsigned int frame_count = 0;
     unsigned int idle_loops = 0;
     int wait_for_idr = 0;
+    uint64_t read_done_seq = 0;
+    uint64_t read_done_fail_count = 0;
 
     if (nalu_datafifo_open(&reader, g_fifo_phy_addr) != 0) {
         printf("[datafifo] open failed, RTP sender stopped\n");
@@ -757,9 +879,25 @@ static void *datafifo_rtp_sender_loop(int sock)
         int dest_valid = 0;
         int need_parameter_sets = 0;
         int can_send = 0;
+        int valid_msg = 0;
+        int stale_frame = 0;
+        int should_copy = 0;
+        int copy_ret = -1;
+        int snapshot_ret = 0;
+        int send_failed = 0;
+        int read_done_ret = -1;
+        uint64_t msg_seq = 0;
+        uint32_t msg_total_len = 0;
+        uint32_t msg_flags = 0;
+        uint64_t copy_start_ms = 0;
+        uint64_t copy_cost_ms = 0;
+        uint64_t pre_done_cost_ms = 0;
+        uint64_t read_done_start_ms = 0;
+        uint64_t read_done_cost_ms = 0;
         uint64_t send_start_ms = 0;
         uint64_t send_cost_ms = 0;
-        k_u32 i;
+        uint64_t prev_sent_seq = 0;
+        datafifo_owned_frame_t owned_frame;
 
         if (nalu_datafifo_read(&reader, &msg, &item) != 0) {
             idle_loops++;
@@ -777,9 +915,10 @@ static void *datafifo_rtp_sender_loop(int sock)
         can_send = playing && dest_valid;
 
         if (nalu_datafifo_validate_msg(msg) == 0) {
-            int snapshot_ret = 0;
-            int send_failed = 0;
-            int stale_frame = 0;
+            valid_msg = 1;
+            msg_seq = msg->seq;
+            msg_total_len = msg->total_len;
+            msg_flags = msg->reserved;
 
             if (last_read_seq != 0 && msg->seq <= last_read_seq) {
                 stale_frame = 1;
@@ -793,79 +932,114 @@ static void *datafifo_rtp_sender_loop(int sock)
                 last_read_seq = msg->seq;
             }
 
-            if (!stale_frame && (msg->reserved & MPP_NALU_IPC_FLAG_SNAPSHOT)) {
-                snapshot_ret = datafifo_snapshot_process(msg, g_snapshot_ready);
-                printf("[snapshot] seq=%llu process ret=%d flags=0x%x\n",
-                       (unsigned long long)msg->seq,
-                       snapshot_ret,
-                       msg->reserved);
+            should_copy = !stale_frame &&
+                          datafifo_should_copy_frame(can_send, need_parameter_sets, msg);
+            if (should_copy) {
+                copy_start_ms = monotonic_ms();
+                copy_ret = datafifo_copy_msg_packs(msg, &owned_frame);
+                copy_cost_ms = monotonic_ms() - copy_start_ms;
             }
 
             if (stale_frame) {
                 printf("[datafifo] drop stale seq=%llu last=%llu, READ_DONE only\n",
                        (unsigned long long)msg->seq,
                        (unsigned long long)last_read_seq);
-            } else {
-                if (can_send) {
-                    send_start_ms = monotonic_ms();
-                }
-
-                for (i = 0; i < msg->pack_cnt; i++) {
-                    uint8_t marker = (i + 1U == msg->pack_cnt) ? 1 : 0;
-
-                    if (datafifo_process_pack_for_playback(sock,
-                                                           &dest,
-                                                           msg->seq,
-                                                           i,
-                                                           &msg->packs[i],
-                                                           &seq,
-                                                           timestamp,
-                                                           ssrc,
-                                                           marker,
-                                                           can_send,
-                                                           &wait_for_idr) != 0) {
-                        send_failed = 1;
-                        printf("[datafifo] process pack[%u] failed: phys=0x%llx len=%u\n",
-                               i,
-                               (unsigned long long)msg->packs[i].phys_addr,
-                               msg->packs[i].len);
-                    }
-                }
-
-                if (can_send) {
-                    send_cost_ms = monotonic_ms() - send_start_ms;
-                    timestamp += RTP_TS_STEP;
-                    last_sent_seq = msg->seq;
-                } else {
-                    printf("[datafifo] seq=%llu no RTP target play=%d dest=%d flags=0x%x\n",
-                           (unsigned long long)msg->seq,
-                           playing,
-                           dest_valid,
-                           msg->reserved);
-                }
-
-                frame_count++;
-                log_datafifo_stats(msg,
-                                   can_send,
-                                   0,
-                                   last_sent_seq,
-                                   send_cost_ms,
-                                   frame_count,
-                                   need_parameter_sets ||
-                                   send_cost_ms > (1000U / VIDEO_FPS) ||
-                                   send_failed ||
-                                   snapshot_ret != 0);
+            } else if (should_copy && copy_ret != 0) {
+                printf("[datafifo] copy failed seq=%llu, READ_DONE before drop\n",
+                       (unsigned long long)msg->seq);
             }
         } else {
             printf("[datafifo] skip invalid item but still READ_DONE item=%p\n",
                    item);
         }
 
-        /*
-         * This is mandatory. The big core releases the VENC stream only after
-         * the reader marks this DATAFIFO item as done.
-         */
-        nalu_datafifo_read_done(&reader, item);
+        pre_done_cost_ms = monotonic_ms() - last_item_ms;
+        read_done_start_ms = monotonic_ms();
+        read_done_ret = nalu_datafifo_read_done(&reader, item);
+        read_done_cost_ms = monotonic_ms() - read_done_start_ms;
+        if (read_done_ret != 0) {
+            read_done_fail_count++;
+        } else if (valid_msg) {
+            read_done_seq = msg_seq;
+        }
+        log_datafifo_read_done(msg_seq,
+                               read_done_seq,
+                               read_done_fail_count,
+                               read_done_ret,
+                               copy_cost_ms,
+                               read_done_cost_ms,
+                               pre_done_cost_ms,
+                               msg_total_len,
+                               msg_flags,
+                               !valid_msg ||
+                               stale_frame ||
+                               should_copy ||
+                               read_done_ret != 0);
+
+        if (valid_msg && !stale_frame && should_copy && copy_ret == 0) {
+            if (msg_flags & MPP_NALU_IPC_FLAG_SNAPSHOT) {
+                snapshot_ret = datafifo_snapshot_process_copied(&owned_frame.frame,
+                                                                g_snapshot_ready);
+                printf("[snapshot] copied seq=%llu process ret=%d flags=0x%x\n",
+                       (unsigned long long)owned_frame.frame.seq,
+                       snapshot_ret,
+                       owned_frame.frame.reserved);
+            }
+
+            if (can_send) {
+                send_start_ms = monotonic_ms();
+            }
+
+            prev_sent_seq = last_sent_seq;
+            if (datafifo_process_copied_frame_for_playback(sock,
+                                                           &dest,
+                                                           &owned_frame.frame,
+                                                           &seq,
+                                                           timestamp,
+                                                           ssrc,
+                                                           can_send,
+                                                           &wait_for_idr) != 0) {
+                send_failed = 1;
+            }
+
+            if (can_send) {
+                send_cost_ms = monotonic_ms() - send_start_ms;
+                timestamp += RTP_TS_STEP;
+                last_sent_seq = owned_frame.frame.seq;
+            } else {
+                printf("[datafifo] seq=%llu no RTP target play=%d dest=%d flags=0x%x\n",
+                       (unsigned long long)owned_frame.frame.seq,
+                       playing,
+                       dest_valid,
+                       owned_frame.frame.reserved);
+            }
+
+            frame_count++;
+            log_datafifo_frame_stats(owned_frame.frame.seq,
+                                     owned_frame.frame.pack_cnt,
+                                     owned_frame.frame.total_len,
+                                     owned_frame.frame.frame_pts,
+                                     owned_frame.frame.submit_time_ms,
+                                     owned_frame.frame.reserved,
+                                     can_send,
+                                     prev_sent_seq,
+                                     send_cost_ms,
+                                     frame_count,
+                                     need_parameter_sets ||
+                                     send_cost_ms > (1000U / VIDEO_FPS) ||
+                                     send_failed ||
+                                     snapshot_ret != 0);
+            datafifo_owned_frame_free(&owned_frame);
+        } else if (valid_msg && !stale_frame) {
+            frame_count++;
+            if (!can_send) {
+                printf("[datafifo] seq=%llu no copy needed play=%d dest=%d flags=0x%x\n",
+                       (unsigned long long)msg_seq,
+                       playing,
+                       dest_valid,
+                       msg_flags);
+            }
+        }
     }
 
     nalu_datafifo_close(&reader);

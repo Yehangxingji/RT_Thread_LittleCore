@@ -281,7 +281,7 @@ int nalu_datafifo_read_done(nalu_datafifo_reader_t *reader, void *item)
 
     return 0;
 }
-
+// 验证NALU IPC消息
 int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
 {
     k_u32 i;
@@ -290,9 +290,10 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
     if (msg == NULL) {
         return -1;
     }
-
+//  验证消息魔数
     if (msg->magic != MPP_NALU_IPC_MAGIC) {
-        printf("[datafifo] validate failed: bad magic=0x%x seq=%llu chn=%u version=%u packs=%u total=%u flags=0x%x submit=%llu\n",
+        printf("[datafifo] validate failed: bad magic=0x%x seq=%llu chn=%u 
+                version=%u packs=%u total=%u flags=0x%x submit=%llu\n",
                msg->magic,
                (unsigned long long)msg->seq,
                msg->chn,
@@ -303,9 +304,10 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
                (unsigned long long)msg->submit_time_ms);
         return -1;
     }
-
+//  验证消息版本
     if (msg->version != MPP_NALU_IPC_VERSION) {
-        printf("[datafifo] validate failed: bad version=%u seq=%llu chn=%u packs=%u total=%u flags=0x%x submit=%llu\n",
+        printf("[datafifo] validate failed: bad version=%u seq=%llu chn=%u 
+                packs=%u total=%u flags=0x%x submit=%llu\n",
                msg->version,
                (unsigned long long)msg->seq,
                msg->chn,
@@ -315,9 +317,10 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
                (unsigned long long)msg->submit_time_ms);
         return -1;
     }
-
+//  验证包数量
     if (msg->pack_cnt == 0 || msg->pack_cnt > MPP_NALU_IPC_MAX_PACKS) {
-        printf("[datafifo] validate failed: bad pack_cnt=%u seq=%llu chn=%u total=%u flags=0x%x submit=%llu\n",
+        printf("[datafifo] validate failed: bad pack_cnt=%u seq=%llu chn=%u 
+                total=%u flags=0x%x submit=%llu\n",
                msg->pack_cnt,
                (unsigned long long)msg->seq,
                msg->chn,
@@ -326,10 +329,11 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
                (unsigned long long)msg->submit_time_ms);
         return -1;
     }
-
+//  验证包
     for (i = 0; i < msg->pack_cnt; i++) {
         if (msg->packs[i].phys_addr == 0 || msg->packs[i].len == 0) {
-            printf("[datafifo] validate failed: seq=%llu bad pack[%u] phys=0x%llx len=%u total=%u flags=0x%x\n",
+            printf("[datafifo] validate failed: seq=%llu bad pack[%u] phys=0x%llx 
+                    len=%u total=%u flags=0x%x\n",
                    (unsigned long long)msg->seq,
                    i,
                    (unsigned long long)msg->packs[i].phys_addr,
@@ -340,7 +344,8 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
         }
         if (msg->packs[i].len > 8U * 1024U * 1024U ||
             sum_len > 0xffffffffU - msg->packs[i].len) {
-            printf("[datafifo] validate failed: seq=%llu unreasonable pack[%u] len=%u total=%u flags=0x%x\n",
+            printf("[datafifo] validate failed: seq=%llu unreasonable pack[%u] 
+                    len=%u total=%u flags=0x%x\n",
                    (unsigned long long)msg->seq,
                    i,
                    msg->packs[i].len,
@@ -350,9 +355,10 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
         }
         sum_len += msg->packs[i].len;
     }
-
+//  验证总长度
     if (msg->total_len != 0 && msg->total_len != sum_len) {
-        printf("[datafifo] validate failed: seq=%llu total_len mismatch total=%u sum=%u flags=0x%x submit=%llu\n",
+        printf("[datafifo] validate failed: seq=%llu total_len mismatch 
+            total=%u sum=%u flags=0x%xsubmit=%llu\n",
                (unsigned long long)msg->seq,
                msg->total_len,
                sum_len,
