@@ -28,6 +28,7 @@ extern pthread_mutex_t g_mutex;
 extern pthread_cond_t g_cond;
 extern int g_play;
 extern int g_client_addr_set;
+extern int g_need_parameter_sets;
 extern struct sockaddr_in g_client_addr;
 
 // 处理RTSP客户端

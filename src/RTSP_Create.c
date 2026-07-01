@@ -40,11 +40,24 @@ typedef enum {
     STREAM_SOURCE_DATAFIFO = 1
 } stream_source_t;
 
+#define H265_NAL_IDR_W_RADL 19
+#define H265_NAL_IDR_N_LP   20
+#define H265_NAL_VPS        32
+#define H265_NAL_SPS        33
+#define H265_NAL_PPS        34
+#define H265_PARAM_SET_MAX_SIZE (16U * 1024U)
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+} h265_param_set_cache_t;
+
 pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
 
 int g_play = 0;
 int g_client_addr_set = 0;
+int g_need_parameter_sets = 0;
 struct sockaddr_in g_client_addr;
 
 static stream_source_t g_source = STREAM_SOURCE_FILE;
@@ -53,6 +66,9 @@ static uint8_t *g_file_buf = NULL;
 static nalu_t *g_nalus = NULL;
 static size_t g_nalu_count = 0;
 static int g_snapshot_ready = 0;
+static h265_param_set_cache_t g_vps_cache;
+static h265_param_set_cache_t g_sps_cache;
+static h265_param_set_cache_t g_pps_cache;
 
 #define DATAFIFO_LOG_INTERVAL 30U
 
@@ -77,6 +93,12 @@ static void cleanup_resources(void)
         g_snapshot_ready = 0;
     }
     datafifo_snapshot_deinit();
+    free(g_vps_cache.data);
+    free(g_sps_cache.data);
+    free(g_pps_cache.data);
+    memset(&g_vps_cache, 0, sizeof(g_vps_cache));
+    memset(&g_sps_cache, 0, sizeof(g_sps_cache));
+    memset(&g_pps_cache, 0, sizeof(g_pps_cache));
     free(g_nalus);
     g_nalus = NULL;
     free(g_file_buf);
@@ -175,16 +197,36 @@ static int parse_args(int argc, char **argv)
 
 static void get_rtsp_target(int *playing,
                             struct sockaddr_in *dest,
-                            int *dest_valid)
+                            int *dest_valid,
+                            int *need_parameter_sets)
 {
     pthread_mutex_lock(&g_mutex);
     *playing = g_play;
     *dest_valid = g_client_addr_set;
+    *need_parameter_sets = g_need_parameter_sets;
     if (g_client_addr_set) {
         *dest = g_client_addr;
     } else {
         memset(dest, 0, sizeof(*dest));
     }
+    pthread_mutex_unlock(&g_mutex);
+}
+
+static int rtsp_session_needs_parameter_sets(void)
+{
+    int need;
+
+    pthread_mutex_lock(&g_mutex);
+    need = g_need_parameter_sets;
+    pthread_mutex_unlock(&g_mutex);
+
+    return need;
+}
+
+static void rtsp_mark_parameter_sets_sent(void)
+{
+    pthread_mutex_lock(&g_mutex);
+    g_need_parameter_sets = 0;
     pthread_mutex_unlock(&g_mutex);
 }
 
@@ -267,6 +309,371 @@ static void log_datafifo_stats(const mpp_nalu_ipc_msg *msg,
            msg->reserved);
 }
 
+static long h265_find_start_code_local(const uint8_t *buf,
+                                       size_t size,
+                                       size_t offset,
+                                       size_t *start_code_len)
+{
+    size_t i;
+
+    for (i = offset; i + 3U <= size; i++) {
+        if (buf[i] == 0x00 && buf[i + 1U] == 0x00 && buf[i + 2U] == 0x01) {
+            *start_code_len = 3U;
+            return (long)i;
+        }
+
+        if (i + 4U <= size &&
+            buf[i] == 0x00 &&
+            buf[i + 1U] == 0x00 &&
+            buf[i + 2U] == 0x00 &&
+            buf[i + 3U] == 0x01) {
+            *start_code_len = 4U;
+            return (long)i;
+        }
+    }
+
+    return -1;
+}
+
+static int h265_buffer_starts_with_start_code_local(const uint8_t *buf,
+                                                    size_t len)
+{
+    if (buf == NULL || len < 3U) {
+        return 0;
+    }
+
+    if (buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x01) {
+        return 1;
+    }
+
+    return len >= 4U &&
+           buf[0] == 0x00 &&
+           buf[1] == 0x00 &&
+           buf[2] == 0x00 &&
+           buf[3] == 0x01;
+}
+
+static int h265_is_parameter_set(int nal_type)
+{
+    return nal_type == H265_NAL_VPS ||
+           nal_type == H265_NAL_SPS ||
+           nal_type == H265_NAL_PPS;
+}
+
+static int h265_is_idr(int nal_type)
+{
+    return nal_type == H265_NAL_IDR_W_RADL ||
+           nal_type == H265_NAL_IDR_N_LP;
+}
+
+static const char *h265_nal_name(int nal_type)
+{
+    switch (nal_type) {
+    case H265_NAL_VPS:
+        return "VPS";
+    case H265_NAL_SPS:
+        return "SPS";
+    case H265_NAL_PPS:
+        return "PPS";
+    case H265_NAL_IDR_W_RADL:
+        return "IDR_W_RADL";
+    case H265_NAL_IDR_N_LP:
+        return "IDR_N_LP";
+    default:
+        return "NAL";
+    }
+}
+
+static h265_param_set_cache_t *h265_param_cache_for_type(int nal_type)
+{
+    if (nal_type == H265_NAL_VPS) {
+        return &g_vps_cache;
+    }
+    if (nal_type == H265_NAL_SPS) {
+        return &g_sps_cache;
+    }
+    if (nal_type == H265_NAL_PPS) {
+        return &g_pps_cache;
+    }
+
+    return NULL;
+}
+
+static int h265_have_all_parameter_sets(void)
+{
+    return g_vps_cache.data != NULL && g_vps_cache.len > 0 &&
+           g_sps_cache.data != NULL && g_sps_cache.len > 0 &&
+           g_pps_cache.data != NULL && g_pps_cache.len > 0;
+}
+
+static int h265_cache_parameter_set(const uint8_t *nalu, size_t nalu_len)
+{
+    int nal_type;
+    uint8_t *copy;
+    h265_param_set_cache_t *cache;
+
+    if (nalu == NULL || nalu_len < 2U) {
+        return 0;
+    }
+
+    nal_type = h265_nalu_type(nalu, nalu_len);
+    cache = h265_param_cache_for_type(nal_type);
+    if (cache == NULL) {
+        return 0;
+    }
+
+    if (nalu_len > H265_PARAM_SET_MAX_SIZE) {
+        printf("[h265] skip oversized %s parameter set len=%lu\n",
+               h265_nal_name(nal_type),
+               (unsigned long)nalu_len);
+        return -1;
+    }
+
+    if (cache->data != NULL &&
+        cache->len == nalu_len &&
+        memcmp(cache->data, nalu, nalu_len) == 0) {
+        return 0;
+    }
+
+    copy = (uint8_t *)malloc(nalu_len);
+    if (copy == NULL) {
+        printf("[h265] malloc failed for %s len=%lu\n",
+               h265_nal_name(nal_type),
+               (unsigned long)nalu_len);
+        return -1;
+    }
+
+    memcpy(copy, nalu, nalu_len);
+    free(cache->data);
+    cache->data = copy;
+    cache->len = nalu_len;
+
+    printf("[h265] cached %s len=%lu\n",
+           h265_nal_name(nal_type),
+           (unsigned long)nalu_len);
+
+    return 0;
+}
+
+static int send_cached_parameter_sets(int sock,
+                                      const struct sockaddr_in *dest,
+                                      uint16_t *seq,
+                                      uint32_t timestamp,
+                                      uint32_t ssrc)
+{
+    static unsigned int missing_log_count = 0;
+
+    if (!h265_have_all_parameter_sets()) {
+        missing_log_count++;
+        if (missing_log_count == 1U || (missing_log_count % 30U) == 0U) {
+            printf("[rtp] waiting for VPS/SPS/PPS before PLAY: vps=%lu sps=%lu pps=%lu\n",
+                   (unsigned long)g_vps_cache.len,
+                   (unsigned long)g_sps_cache.len,
+                   (unsigned long)g_pps_cache.len);
+        }
+        return -1;
+    }
+
+    if (send_h265_nalu_rtp(sock, dest, g_vps_cache.data, g_vps_cache.len,
+                           seq, timestamp, ssrc, 0) != 0 ||
+        send_h265_nalu_rtp(sock, dest, g_sps_cache.data, g_sps_cache.len,
+                           seq, timestamp, ssrc, 0) != 0 ||
+        send_h265_nalu_rtp(sock, dest, g_pps_cache.data, g_pps_cache.len,
+                           seq, timestamp, ssrc, 0) != 0) {
+        return -1;
+    }
+
+    printf("[rtp] sent cached VPS/SPS/PPS ts=%lu seq=%u -> %s:%d\n",
+           (unsigned long)timestamp,
+           (unsigned int)*seq,
+           inet_ntoa(dest->sin_addr),
+           ntohs(dest->sin_port));
+
+    return 0;
+}
+
+static int datafifo_process_nalu_for_playback(int sock,
+                                              const struct sockaddr_in *dest,
+                                              const uint8_t *nalu,
+                                              size_t nalu_len,
+                                              uint16_t *seq,
+                                              uint32_t timestamp,
+                                              uint32_t ssrc,
+                                              uint8_t marker,
+                                              int can_send,
+                                              int *wait_for_idr)
+{
+    int nal_type;
+
+    if (nalu == NULL || nalu_len < 2U) {
+        return 0;
+    }
+
+    nal_type = h265_nalu_type(nalu, nalu_len);
+    if (h265_is_parameter_set(nal_type)) {
+        h265_cache_parameter_set(nalu, nalu_len);
+    }
+
+    if (!can_send) {
+        return 0;
+    }
+
+    if (rtsp_session_needs_parameter_sets()) {
+        if (send_cached_parameter_sets(sock, dest, seq, timestamp, ssrc) != 0) {
+            return 0;
+        }
+        rtsp_mark_parameter_sets_sent();
+        *wait_for_idr = 1;
+        printf("[rtp] parameter sets sent, waiting for IDR\n");
+    }
+
+    if (*wait_for_idr) {
+        if (!h265_is_idr(nal_type)) {
+            return 0;
+        }
+        *wait_for_idr = 0;
+        printf("[rtp] IDR found after parameter sets: type=%d len=%lu\n",
+               nal_type,
+               (unsigned long)nalu_len);
+    }
+
+    return send_h265_nalu_rtp(sock,
+                              dest,
+                              nalu,
+                              nalu_len,
+                              seq,
+                              timestamp,
+                              ssrc,
+                              marker);
+}
+
+static int datafifo_process_h265_buffer_for_playback(int sock,
+                                                     const struct sockaddr_in *dest,
+                                                     const uint8_t *buf,
+                                                     size_t len,
+                                                     uint16_t *seq,
+                                                     uint32_t timestamp,
+                                                     uint32_t ssrc,
+                                                     uint8_t last_marker,
+                                                     int can_send,
+                                                     int *wait_for_idr)
+{
+    size_t search_offset = 0;
+
+    if (buf == NULL || len < 2U) {
+        return 0;
+    }
+
+    if (!h265_buffer_starts_with_start_code_local(buf, len)) {
+        return datafifo_process_nalu_for_playback(sock,
+                                                  dest,
+                                                  buf,
+                                                  len,
+                                                  seq,
+                                                  timestamp,
+                                                  ssrc,
+                                                  last_marker,
+                                                  can_send,
+                                                  wait_for_idr);
+    }
+
+    while (1) {
+        size_t sc_len = 0;
+        size_t next_sc_len = 0;
+        long sc_pos;
+        long next_sc_pos;
+        size_t nalu_start;
+        size_t nalu_end;
+        uint8_t marker;
+
+        sc_pos = h265_find_start_code_local(buf, len, search_offset, &sc_len);
+        if (sc_pos < 0) {
+            break;
+        }
+
+        nalu_start = (size_t)sc_pos + sc_len;
+        next_sc_pos = h265_find_start_code_local(buf, len, nalu_start, &next_sc_len);
+        nalu_end = (next_sc_pos < 0) ? len : (size_t)next_sc_pos;
+
+        while (nalu_end > nalu_start && buf[nalu_end - 1U] == 0x00) {
+            nalu_end--;
+        }
+
+        if (nalu_end > nalu_start) {
+            marker = (next_sc_pos < 0) ? last_marker : 0;
+            if (datafifo_process_nalu_for_playback(sock,
+                                                   dest,
+                                                   buf + nalu_start,
+                                                   nalu_end - nalu_start,
+                                                   seq,
+                                                   timestamp,
+                                                   ssrc,
+                                                   marker,
+                                                   can_send,
+                                                   wait_for_idr) != 0) {
+                return -1;
+            }
+        }
+
+        if (next_sc_pos < 0) {
+            break;
+        }
+        search_offset = (size_t)next_sc_pos;
+    }
+
+    return 0;
+}
+
+static int datafifo_process_pack_for_playback(int sock,
+                                              const struct sockaddr_in *dest,
+                                              uint64_t datafifo_seq,
+                                              k_u32 pack_index,
+                                              const mpp_nalu_ipc_pack *pack,
+                                              uint16_t *seq,
+                                              uint32_t timestamp,
+                                              uint32_t ssrc,
+                                              uint8_t marker,
+                                              int can_send,
+                                              int *wait_for_idr)
+{
+    void *virt_addr;
+    int ret;
+
+    virt_addr = nalu_datafifo_mmap_pack(pack);
+    if (virt_addr == NULL) {
+        printf("[datafifo] seq=%llu pack[%u] mmap failed phys=0x%llx len=%u\n",
+               (unsigned long long)datafifo_seq,
+               (unsigned int)pack_index,
+               pack ? (unsigned long long)pack->phys_addr : 0ULL,
+               pack ? pack->len : 0U);
+        return -1;
+    }
+
+    ret = datafifo_process_h265_buffer_for_playback(sock,
+                                                    dest,
+                                                    (const uint8_t *)virt_addr,
+                                                    pack->len,
+                                                    seq,
+                                                    timestamp,
+                                                    ssrc,
+                                                    marker,
+                                                    can_send,
+                                                    wait_for_idr);
+
+    if (nalu_datafifo_munmap_pack(pack, virt_addr) != 0) {
+        printf("[datafifo] seq=%llu pack[%u] munmap failed phys=0x%llx len=%u\n",
+               (unsigned long long)datafifo_seq,
+               (unsigned int)pack_index,
+               pack ? (unsigned long long)pack->phys_addr : 0ULL,
+               pack ? pack->len : 0U);
+        if (ret == 0) {
+            ret = -1;
+        }
+    }
+
+    return ret;
+}
+
 
 static void *file_rtp_sender_loop(int sock)
 {
@@ -335,6 +742,7 @@ static void *datafifo_rtp_sender_loop(int sock)
     uint64_t last_item_ms = monotonic_ms();
     unsigned int frame_count = 0;
     unsigned int idle_loops = 0;
+    int wait_for_idr = 0;
 
     if (nalu_datafifo_open(&reader, g_fifo_phy_addr) != 0) {
         printf("[datafifo] open failed, RTP sender stopped\n");
@@ -347,6 +755,8 @@ static void *datafifo_rtp_sender_loop(int sock)
         struct sockaddr_in dest;
         int playing = 0;
         int dest_valid = 0;
+        int need_parameter_sets = 0;
+        int can_send = 0;
         uint64_t send_start_ms = 0;
         uint64_t send_cost_ms = 0;
         k_u32 i;
@@ -363,7 +773,8 @@ static void *datafifo_rtp_sender_loop(int sock)
         }
         last_item_ms = monotonic_ms();
 
-        get_rtsp_target(&playing, &dest, &dest_valid);
+        get_rtsp_target(&playing, &dest, &dest_valid, &need_parameter_sets);
+        can_send = playing && dest_valid;
 
         if (nalu_datafifo_validate_msg(msg) == 0) {
             int snapshot_ret = 0;
@@ -394,51 +805,55 @@ static void *datafifo_rtp_sender_loop(int sock)
                 printf("[datafifo] drop stale seq=%llu last=%llu, READ_DONE only\n",
                        (unsigned long long)msg->seq,
                        (unsigned long long)last_read_seq);
-            } else if (playing && dest_valid) {
-                send_start_ms = monotonic_ms();
+            } else {
+                if (can_send) {
+                    send_start_ms = monotonic_ms();
+                }
+
                 for (i = 0; i < msg->pack_cnt; i++) {
                     uint8_t marker = (i + 1U == msg->pack_cnt) ? 1 : 0;
 
-                    if (send_datafifo_pack(sock,
-                                           &dest,
-                                           msg->seq,
-                                           i,
-                                           &msg->packs[i],
-                                           &seq,
-                                           timestamp,
-                                           ssrc,
-                                           marker) != 0) {
+                    if (datafifo_process_pack_for_playback(sock,
+                                                           &dest,
+                                                           msg->seq,
+                                                           i,
+                                                           &msg->packs[i],
+                                                           &seq,
+                                                           timestamp,
+                                                           ssrc,
+                                                           marker,
+                                                           can_send,
+                                                           &wait_for_idr) != 0) {
                         send_failed = 1;
-                        printf("[datafifo] send pack[%u] failed: phys=0x%llx len=%u\n",
+                        printf("[datafifo] process pack[%u] failed: phys=0x%llx len=%u\n",
                                i,
                                (unsigned long long)msg->packs[i].phys_addr,
                                msg->packs[i].len);
                     }
                 }
-                send_cost_ms = monotonic_ms() - send_start_ms;
-                timestamp += RTP_TS_STEP;
+
+                if (can_send) {
+                    send_cost_ms = monotonic_ms() - send_start_ms;
+                    timestamp += RTP_TS_STEP;
+                    last_sent_seq = msg->seq;
+                } else {
+                    printf("[datafifo] seq=%llu no RTP target play=%d dest=%d flags=0x%x\n",
+                           (unsigned long long)msg->seq,
+                           playing,
+                           dest_valid,
+                           msg->reserved);
+                }
+
                 frame_count++;
                 log_datafifo_stats(msg,
-                                   1,
+                                   can_send,
                                    0,
                                    last_sent_seq,
                                    send_cost_ms,
                                    frame_count,
-                                   send_cost_ms > (1000U / VIDEO_FPS) || send_failed || snapshot_ret != 0);
-                last_sent_seq = msg->seq;
-            } else {
-                printf("[datafifo] seq=%llu no RTP target play=%d dest=%d flags=0x%x\n",
-                       (unsigned long long)msg->seq,
-                       playing,
-                       dest_valid,
-                       msg->reserved);
-                frame_count++;
-                log_datafifo_stats(msg,
-                                   0,
-                                   0,
-                                   last_sent_seq,
-                                   0,
-                                   frame_count,
+                                   need_parameter_sets ||
+                                   send_cost_ms > (1000U / VIDEO_FPS) ||
+                                   send_failed ||
                                    snapshot_ret != 0);
             }
         } else {

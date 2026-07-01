@@ -237,6 +237,7 @@ void handle_rtsp_client(int client_fd, const struct sockaddr_in *cli_addr)
             g_client_addr.sin_port = htons(client_port);
             g_client_addr_set = 1;
             g_play = 0;
+            g_need_parameter_sets = 1;
             pthread_mutex_unlock(&g_mutex);
 
             printf("[rtsp] SETUP client RTP target %s:%d\n",
@@ -249,6 +250,7 @@ void handle_rtsp_client(int client_fd, const struct sockaddr_in *cli_addr)
         {
             pthread_mutex_lock(&g_mutex);
             g_play = 1;
+            g_need_parameter_sets = 1;
             pthread_cond_signal(&g_cond);
             pthread_mutex_unlock(&g_mutex);
 

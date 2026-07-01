@@ -22,6 +22,6 @@ girlshy.h265为一个测试视频文件，可用VLC打开验证
 
 换用ffplay的低延迟模式后，延迟降低了
 调用指令如下：
-ffplay -fflags nobuffer -flags low_delay -framedrop -strict experimental -rtsp_transport udp -probesize 32 -analyzeduration 0 rtsp://172.17.106.28/stream
+ffplay -fflags nobuffer -flags low_delay -framedrop -strict experimental -rtsp_transport udp -probesize 32 -analyzeduration 0 rtsp://10.164.129.28/stream
 
 
