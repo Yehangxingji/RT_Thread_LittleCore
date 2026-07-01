@@ -64,11 +64,13 @@ int send_h265_buffer_rtp(int sock,
                          uint8_t last_marker);
 
 int send_datafifo_pack(int sock,
-                              const struct sockaddr_in *dest,
-                              const mpp_nalu_ipc_pack *pack,
-                              uint16_t *seq,
-                              uint32_t timestamp,
-                              uint32_t ssrc,
-                              uint8_t marker);
+                       const struct sockaddr_in *dest,
+                       uint64_t datafifo_seq,
+                       k_u32 pack_index,
+                       const mpp_nalu_ipc_pack *pack,
+                       uint16_t *seq,
+                       uint32_t timestamp,
+                       uint32_t ssrc,
+                       uint8_t marker);
 
 #endif

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #ifdef USE_RT_SMART
@@ -106,6 +107,33 @@ static void little_sys_close_mmap_fd(void)
 }
 #endif
 
+static k_u64 nalu_datafifo_log_now_ms(void)
+{
+    struct timeval tv;
+
+    if (gettimeofday(&tv, NULL) != 0) {
+        return 0;
+    }
+
+    return (k_u64)tv.tv_sec * 1000ULL + (k_u64)(tv.tv_usec / 1000U);
+}
+
+static int nalu_datafifo_should_log(k_u64 *last_ms, k_u64 interval_ms)
+{
+    k_u64 now = nalu_datafifo_log_now_ms();
+
+    if (now == 0) {
+        return 0;
+    }
+
+    if (*last_ms == 0 || now - *last_ms >= interval_ms) {
+        *last_ms = now;
+        return 1;
+    }
+
+    return 0;
+}
+
 int nalu_datafifo_open(nalu_datafifo_reader_t *reader, k_u64 fifo_phy_addr)
 {
     k_s32 ret;
@@ -161,9 +189,18 @@ int nalu_datafifo_read(nalu_datafifo_reader_t *reader,
     k_s32 ret;
     k_u32 read_len = 0;
     void *item = NULL;
+    static k_u64 last_poll_begin_log_ms;
+    static k_u64 last_idle_log_ms;
+    static k_u64 idle_poll_count;
 
     if (reader == NULL || !reader->opened || out_msg == NULL || out_item == NULL) {
         return -1;
+    }
+
+    if (NALU_DATAFIFO_VERBOSE_LOG &&
+        nalu_datafifo_should_log(&last_poll_begin_log_ms, NALU_DATAFIFO_IDLE_LOG_INTERVAL_MS)) {
+        printf("[datafifo] poll begin GET_AVAIL_READ_LEN idle_polls=%llu\n",
+               (unsigned long long)idle_poll_count);
     }
 
     ret = kd_datafifo_cmd(reader->handle, DATAFIFO_CMD_GET_AVAIL_READ_LEN, &read_len);
@@ -173,8 +210,16 @@ int nalu_datafifo_read(nalu_datafifo_reader_t *reader,
     }
 
     if (read_len < MPP_NALU_IPC_ITEM_SIZE) {
+        idle_poll_count++;
+        if (nalu_datafifo_should_log(&last_idle_log_ms, NALU_DATAFIFO_IDLE_LOG_INTERVAL_MS)) {
+            printf("[datafifo] poll idle avail=%u need=%u idle_polls=%llu\n",
+                   (unsigned int)read_len,
+                   (unsigned int)MPP_NALU_IPC_ITEM_SIZE,
+                   (unsigned long long)idle_poll_count);
+        }
         return -1;
     }
+    idle_poll_count = 0;
 
     if (read_len > NALU_DATAFIFO_FIFO_ENTRIES * MPP_NALU_IPC_ITEM_SIZE) {
         printf("[datafifo] bad avail read len=%u, max=%u\n",
@@ -183,25 +228,52 @@ int nalu_datafifo_read(nalu_datafifo_reader_t *reader,
         return -1;
     }
 
+    if (NALU_DATAFIFO_VERBOSE_LOG) {
+        printf("[datafifo] read call begin avail=%u\n", (unsigned int)read_len);
+    }
     ret = kd_datafifo_read(reader->handle, &item);
     if (ret != 0 || item == NULL) {
+        printf("[datafifo] kd_datafifo_read failed ret=0x%x item=%p avail=%u\n",
+               ret,
+               item,
+               (unsigned int)read_len);
         return -1;
     }
 
     *out_item = item;
     *out_msg = (const mpp_nalu_ipc_msg *)item;
+    if (NALU_DATAFIFO_VERBOSE_LOG || ((*out_msg)->reserved & MPP_NALU_IPC_FLAG_SNAPSHOT)) {
+        printf("[datafifo] read item seq=%llu chn=%u packs=%u total=%u flags=0x%x submit=%llu item=%p\n",
+               (unsigned long long)(*out_msg)->seq,
+               (*out_msg)->chn,
+               (*out_msg)->pack_cnt,
+               (*out_msg)->total_len,
+               (*out_msg)->reserved,
+               (unsigned long long)(*out_msg)->submit_time_ms,
+               item);
+    }
     return 0;
 }
 
 int nalu_datafifo_read_done(nalu_datafifo_reader_t *reader, void *item)
 {
     k_s32 ret;
+    const mpp_nalu_ipc_msg *msg = (const mpp_nalu_ipc_msg *)item;
+    k_u64 seq;
 
     if (reader == NULL || !reader->opened || item == NULL) {
         return -1;
     }
 
+    seq = msg->seq;
     ret = kd_datafifo_cmd(reader->handle, DATAFIFO_CMD_READ_DONE, item);
+    if (NALU_DATAFIFO_VERBOSE_LOG || ret != 0 ||
+        (msg->reserved & MPP_NALU_IPC_FLAG_SNAPSHOT)) {
+        printf("[datafifo] READ_DONE seq=%llu item=%p ret=0x%x\n",
+               (unsigned long long)seq,
+               item,
+               ret);
+    }
     if (ret != 0) {
         printf("[datafifo] DATAFIFO_CMD_READ_DONE failed, ret=0x%x\n", ret);
         return -1;
@@ -220,42 +292,72 @@ int nalu_datafifo_validate_msg(const mpp_nalu_ipc_msg *msg)
     }
 
     if (msg->magic != MPP_NALU_IPC_MAGIC) {
-        printf("[datafifo] bad magic=0x%x\n", msg->magic);
+        printf("[datafifo] validate failed: bad magic=0x%x seq=%llu chn=%u version=%u packs=%u total=%u flags=0x%x submit=%llu\n",
+               msg->magic,
+               (unsigned long long)msg->seq,
+               msg->chn,
+               msg->version,
+               msg->pack_cnt,
+               msg->total_len,
+               msg->reserved,
+               (unsigned long long)msg->submit_time_ms);
         return -1;
     }
 
     if (msg->version != MPP_NALU_IPC_VERSION) {
-        printf("[datafifo] bad version=%u\n", msg->version);
+        printf("[datafifo] validate failed: bad version=%u seq=%llu chn=%u packs=%u total=%u flags=0x%x submit=%llu\n",
+               msg->version,
+               (unsigned long long)msg->seq,
+               msg->chn,
+               msg->pack_cnt,
+               msg->total_len,
+               msg->reserved,
+               (unsigned long long)msg->submit_time_ms);
         return -1;
     }
 
     if (msg->pack_cnt == 0 || msg->pack_cnt > MPP_NALU_IPC_MAX_PACKS) {
-        printf("[datafifo] bad pack_cnt=%u\n", msg->pack_cnt);
+        printf("[datafifo] validate failed: bad pack_cnt=%u seq=%llu chn=%u total=%u flags=0x%x submit=%llu\n",
+               msg->pack_cnt,
+               (unsigned long long)msg->seq,
+               msg->chn,
+               msg->total_len,
+               msg->reserved,
+               (unsigned long long)msg->submit_time_ms);
         return -1;
     }
 
     for (i = 0; i < msg->pack_cnt; i++) {
         if (msg->packs[i].phys_addr == 0 || msg->packs[i].len == 0) {
-            printf("[datafifo] bad pack[%u]: phys=0x%llx len=%u\n",
+            printf("[datafifo] validate failed: seq=%llu bad pack[%u] phys=0x%llx len=%u total=%u flags=0x%x\n",
+                   (unsigned long long)msg->seq,
                    i,
                    (unsigned long long)msg->packs[i].phys_addr,
-                   msg->packs[i].len);
+                   msg->packs[i].len,
+                   msg->total_len,
+                   msg->reserved);
             return -1;
         }
         if (msg->packs[i].len > 8U * 1024U * 1024U ||
             sum_len > 0xffffffffU - msg->packs[i].len) {
-            printf("[datafifo] unreasonable pack[%u] len=%u\n",
+            printf("[datafifo] validate failed: seq=%llu unreasonable pack[%u] len=%u total=%u flags=0x%x\n",
+                   (unsigned long long)msg->seq,
                    i,
-                   msg->packs[i].len);
+                   msg->packs[i].len,
+                   msg->total_len,
+                   msg->reserved);
             return -1;
         }
         sum_len += msg->packs[i].len;
     }
 
     if (msg->total_len != 0 && msg->total_len != sum_len) {
-        printf("[datafifo] total_len mismatch: total=%u sum=%u\n",
+        printf("[datafifo] validate failed: seq=%llu total_len mismatch total=%u sum=%u flags=0x%x submit=%llu\n",
+               (unsigned long long)msg->seq,
                msg->total_len,
-               sum_len);
+               sum_len,
+               msg->reserved,
+               (unsigned long long)msg->submit_time_ms);
         return -1;
     }
 

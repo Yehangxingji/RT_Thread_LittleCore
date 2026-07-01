@@ -59,6 +59,10 @@ typedef char nalu_datafifo_msg_must_fit_item[
 
 #define NALU_DATAFIFO_FIFO_ENTRIES 3U
 #define NALU_DATAFIFO_READ_IDLE_US 1000U
+#ifndef NALU_DATAFIFO_VERBOSE_LOG
+#define NALU_DATAFIFO_VERBOSE_LOG 0
+#endif
+#define NALU_DATAFIFO_IDLE_LOG_INTERVAL_MS 3000ULL
 
 typedef struct {
     k_datafifo_handle handle;

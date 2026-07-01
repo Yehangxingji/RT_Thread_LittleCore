@@ -410,20 +410,36 @@ int snapshot_writer_enqueue_h265(const uint8_t *data,
                                  uint64_t pts,
                                  const char *reason)
 {
-    snapshot_job_t job;
+    uint8_t *copy;
 
     if (data == NULL || len == 0) {
         return -1;
     }
 
-    memset(&job, 0, sizeof(job));
-    job.data = (uint8_t *)malloc(len);
-    if (job.data == NULL) {
+    copy = (uint8_t *)malloc(len);
+    if (copy == NULL) {
         printf("[snapshot] malloc failed len=%lu\n", (unsigned long)len);
         return -1;
     }
 
-    memcpy(job.data, data, len);
+    memcpy(copy, data, len);
+    return snapshot_writer_enqueue_h265_take(copy, len, pts, reason);
+}
+
+int snapshot_writer_enqueue_h265_take(uint8_t *data,
+                                      size_t len,
+                                      uint64_t pts,
+                                      const char *reason)
+{
+    snapshot_job_t job;
+
+    if (data == NULL || len == 0) {
+        free(data);
+        return -1;
+    }
+
+    memset(&job, 0, sizeof(job));
+    job.data = data;
     job.len = len;
     job.pts = pts;
     snprintf(job.reason, sizeof(job.reason), "%s", reason ? reason : "manual");

@@ -390,19 +390,37 @@ int send_h265_buffer_rtp(int sock,
 
 // 发送DATAFIFO包
 int send_datafifo_pack(int sock,
-                              const struct sockaddr_in *dest,
-                              const mpp_nalu_ipc_pack *pack,
-                              uint16_t *seq,
-                              uint32_t timestamp,
-                              uint32_t ssrc,
-                              uint8_t marker)
+                       const struct sockaddr_in *dest,
+                       uint64_t datafifo_seq,
+                       k_u32 pack_index,
+                       const mpp_nalu_ipc_pack *pack,
+                       uint16_t *seq,
+                       uint32_t timestamp,
+                       uint32_t ssrc,
+                       uint8_t marker)
 {
     void *virt_addr;
     int ret;
+    int munmap_ret;
 
     virt_addr = nalu_datafifo_mmap_pack(pack);
     if (virt_addr == NULL) {
+        printf("[datafifo] seq=%llu pack[%u] mmap failed phys=0x%llx len=%u\n",
+               (unsigned long long)datafifo_seq,
+               (unsigned int)pack_index,
+               pack ? (unsigned long long)pack->phys_addr : 0ULL,
+               pack ? pack->len : 0U);
         return -1;
+    }
+
+    if (NALU_DATAFIFO_VERBOSE_LOG) {
+        printf("[datafifo] seq=%llu pack[%u] mmap ok virt=%p phys=0x%llx len=%u marker=%u\n",
+               (unsigned long long)datafifo_seq,
+               (unsigned int)pack_index,
+               virt_addr,
+               (unsigned long long)pack->phys_addr,
+               pack->len,
+               (unsigned int)marker);
     }
 
     ret = send_h265_buffer_rtp(sock,
@@ -413,8 +431,26 @@ int send_datafifo_pack(int sock,
                                timestamp,
                                ssrc,
                                marker);
-    //printf("rtp:Datafifo");
-    nalu_datafifo_munmap_pack(pack, virt_addr);
+
+    if (NALU_DATAFIFO_VERBOSE_LOG || ret != 0) {
+        printf("[datafifo] seq=%llu pack[%u] rtp ret=%d next_rtp_seq=%u\n",
+               (unsigned long long)datafifo_seq,
+               (unsigned int)pack_index,
+               ret,
+               seq ? (unsigned int)*seq : 0U);
+    }
+
+    munmap_ret = nalu_datafifo_munmap_pack(pack, virt_addr);
+    if (NALU_DATAFIFO_VERBOSE_LOG || munmap_ret != 0) {
+        printf("[datafifo] seq=%llu pack[%u] munmap ret=%d\n",
+               (unsigned long long)datafifo_seq,
+               (unsigned int)pack_index,
+               munmap_ret);
+    }
+    if (munmap_ret != 0 && ret == 0) {
+        ret = -1;
+    }
+
     return ret;
 }
 
