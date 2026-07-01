@@ -116,7 +116,7 @@ static int snapshot_pop_job(snapshot_job_t *job)
     g_snapshot_count--;
     return 0;
 }
-
+// 打开唯一快照文件
 static int snapshot_open_unique_h265(char *h265_path,
                                      size_t h265_path_size,
                                      char *image_path,
@@ -169,7 +169,7 @@ static int snapshot_open_unique_h265(char *h265_path,
     printf("[snapshot] cannot allocate unique snapshot file in %s\n", g_snapshot_dir);
     return -1;
 }
-
+// 写入所有数据
 static int snapshot_write_all(int fd, const uint8_t *data, size_t len)
 {
     size_t offset = 0;
@@ -190,6 +190,7 @@ static int snapshot_write_all(int fd, const uint8_t *data, size_t len)
 
     return 0;
 }
+// 追加文本到字符串
 static int snapshot_append_text(char *dst, size_t dst_size, size_t *offset, const char *src)
 {
     size_t src_len;
@@ -208,7 +209,7 @@ static int snapshot_append_text(char *dst, size_t dst_size, size_t *offset, cons
     dst[*offset] = '\0';
     return 0;
 }
-
+// 对Shell命令进行引号处理
 static int snapshot_shell_quote(char *dst, size_t dst_size, const char *src)
 {
     size_t offset = 0;
@@ -234,7 +235,7 @@ static int snapshot_shell_quote(char *dst, size_t dst_size, const char *src)
 
     return snapshot_append_text(dst, dst_size, &offset, "'");
 }
-
+// 转换H265文件为图片
 static int snapshot_convert_h265_to_image(const char *h265_path, const char *image_path)
 {
     char quoted_h265[SNAPSHOT_CMD_MAX];
@@ -271,8 +272,7 @@ static int snapshot_convert_h265_to_image(const char *h265_path, const char *ima
     printf("[snapshot] converted %s\n", image_path);
     return 0;
 }
-
-
+// 写入快照文件
 static int snapshot_write_file(const snapshot_job_t *job)
 {
     char h265_path[SNAPSHOT_PATH_MAX];

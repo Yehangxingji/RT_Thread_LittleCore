@@ -346,18 +346,19 @@ static int h265_snapshot_append_params(h265_byte_buffer_t *out)
     return 0;
 }
 
-static void h265_snapshot_update_gop_cache(const h265_snapshot_frame_t *frame,
-                                           const mpp_nalu_ipc_msg *msg)
+static void h265_snapshot_update_gop_cache_meta(const h265_snapshot_frame_t *frame,
+                                                uint64_t seq,
+                                                uint64_t pts)
 {
-    if (frame == NULL || msg == NULL || frame->au.data == NULL || frame->au.len == 0) {
+    if (frame == NULL || frame->au.data == NULL || frame->au.len == 0) {
         return;
     }
 
     if (frame->has_irap) {
         h265_buffer_reset(&g_h265_snapshot_cache.current_gop);
         g_h265_snapshot_cache.current_gop_has_irap = 1;
-        g_h265_snapshot_cache.current_gop_pts = msg->frame_pts;
-        g_h265_snapshot_cache.current_gop_start_seq = msg->seq;
+        g_h265_snapshot_cache.current_gop_pts = pts;
+        g_h265_snapshot_cache.current_gop_start_seq = seq;
     } else if (!g_h265_snapshot_cache.current_gop_has_irap) {
         return;
     }
@@ -366,7 +367,7 @@ static void h265_snapshot_update_gop_cache(const h265_snapshot_frame_t *frame,
         g_h265_snapshot_cache.current_gop.len >
         H265_SNAPSHOT_MAX_GOP_BYTES - frame->au.len) {
         printf("[snapshot] drop cached GOP: seq=%llu len=%lu next=%lu max=%u\n",
-               (unsigned long long)msg->seq,
+               (unsigned long long)seq,
                (unsigned long)g_h265_snapshot_cache.current_gop.len,
                (unsigned long)frame->au.len,
                (unsigned int)H265_SNAPSHOT_MAX_GOP_BYTES);
@@ -378,14 +379,24 @@ static void h265_snapshot_update_gop_cache(const h265_snapshot_frame_t *frame,
     if (h265_buffer_append(&g_h265_snapshot_cache.current_gop,
                            frame->au.data,
                            frame->au.len) == 0) {
-        g_h265_snapshot_cache.current_gop_last_seq = msg->seq;
+        g_h265_snapshot_cache.current_gop_last_seq = seq;
     } else {
         printf("[snapshot] cache GOP failed seq=%llu len=%lu\n",
-               (unsigned long long)msg->seq,
+               (unsigned long long)seq,
                (unsigned long)frame->au.len);
         h265_buffer_reset(&g_h265_snapshot_cache.current_gop);
         g_h265_snapshot_cache.current_gop_has_irap = 0;
     }
+}
+
+static void h265_snapshot_update_gop_cache(const h265_snapshot_frame_t *frame,
+                                           const mpp_nalu_ipc_msg *msg)
+{
+    if (msg == NULL) {
+        return;
+    }
+
+    h265_snapshot_update_gop_cache_meta(frame, msg->seq, msg->frame_pts);
 }
 
 static int h265_snapshot_build_output(const h265_snapshot_frame_t *frame,
@@ -590,6 +601,133 @@ int datafifo_snapshot_process(const mpp_nalu_ipc_msg *msg, int writer_ready)
     free(frame.au.data);
     printf("[snapshot] seq=%llu done ret=%d\n",
            (unsigned long long)msg->seq,
+           ret);
+    return ret;
+}
+
+int datafifo_snapshot_process_copied(const datafifo_copied_frame_t *copied, int writer_ready)
+{
+    h265_snapshot_frame_t frame;
+    h265_byte_buffer_t out;
+    int used_cached_gop = 0;
+    k_u32 i;
+    int ret;
+
+    if (copied == NULL) {
+        return -1;
+    }
+
+    if ((copied->reserved & MPP_NALU_IPC_FLAG_SNAPSHOT) == 0) {
+        return 0;
+    }
+
+    printf("[snapshot] copied seq=%llu begin flags=0x%x packs=%u total=%u writer=%d\n",
+           (unsigned long long)copied->seq,
+           copied->reserved,
+           copied->pack_cnt,
+           copied->total_len,
+           writer_ready);
+
+    memset(&frame, 0, sizeof(frame));
+    memset(&out, 0, sizeof(out));
+    frame.copy_au = 1;
+
+    for (i = 0; i < copied->pack_cnt; i++) {
+        if (copied->packs[i].data == NULL || copied->packs[i].len == 0) {
+            printf("[snapshot] copied seq=%llu pack[%u] empty len=%lu\n",
+                   (unsigned long long)copied->seq,
+                   i,
+                   (unsigned long)copied->packs[i].len);
+            continue;
+        }
+
+        if (h265_snapshot_feed_buffer(&frame,
+                                      copied->packs[i].data,
+                                      copied->packs[i].len) != 0) {
+            printf("[snapshot] copied seq=%llu pack[%u] parse failed len=%lu\n",
+                   (unsigned long long)copied->seq,
+                   i,
+                   (unsigned long)copied->packs[i].len);
+        }
+    }
+
+    h265_snapshot_update_gop_cache_meta(&frame, copied->seq, copied->frame_pts);
+
+    if (frame.has_irap && frame.au.len > 0) {
+        if (h265_buffer_replace(&g_h265_snapshot_cache.last_irap,
+                                frame.au.data,
+                                frame.au.len) == 0) {
+            g_h265_snapshot_cache.last_irap_pts = copied->frame_pts;
+            g_h265_snapshot_cache.last_irap_seq = copied->seq;
+            g_h265_snapshot_cache.last_irap_has_vps = frame.has_vps;
+            g_h265_snapshot_cache.last_irap_has_sps = frame.has_sps;
+            g_h265_snapshot_cache.last_irap_has_pps = frame.has_pps;
+        } else {
+            printf("[snapshot] copied cache IRAP failed seq=%llu len=%lu\n",
+                   (unsigned long long)copied->seq,
+                   (unsigned long)frame.au.len);
+        }
+    }
+
+    if (!writer_ready) {
+        printf("[snapshot] drop copied snapshot seq=%llu flags=0x%x: writer not ready\n",
+               (unsigned long long)copied->seq,
+               copied->reserved);
+        free(frame.au.data);
+        printf("[snapshot] copied seq=%llu done ret=-1\n",
+               (unsigned long long)copied->seq);
+        return -1;
+    }
+
+    ret = h265_snapshot_build_output(&frame, &out, &used_cached_gop);
+    if (ret != 0 || out.len == 0) {
+        printf("[snapshot] copied cannot build stream seq=%llu frame_irap=%d cached_irap=%lu cached_gop=%lu params=%d/%d/%d\n",
+               (unsigned long long)copied->seq,
+               frame.has_irap,
+               (unsigned long)g_h265_snapshot_cache.last_irap.len,
+               (unsigned long)g_h265_snapshot_cache.current_gop.len,
+               g_h265_snapshot_cache.vps.len > 0,
+               g_h265_snapshot_cache.sps.len > 0,
+               g_h265_snapshot_cache.pps.len > 0);
+        free(out.data);
+        free(frame.au.data);
+        printf("[snapshot] copied seq=%llu done ret=-1\n",
+               (unsigned long long)copied->seq);
+        return -1;
+    }
+
+    {
+        size_t queued_len = out.len;
+
+        ret = snapshot_writer_enqueue_h265_take(out.data,
+                                                out.len,
+                                                used_cached_gop ?
+                                                g_h265_snapshot_cache.current_gop_pts :
+                                                copied->frame_pts,
+                                                used_cached_gop ?
+                                                "datafifo-cached-gop" :
+                                                "datafifo-irap");
+        out.data = NULL;
+        out.len = 0;
+        if (ret == 0) {
+            printf("[snapshot] captured copied seq=%llu flags=0x%x len=%lu frame_irap=%d cached_gop=%d gop_seq=%llu-%llu params=%d/%d/%d\n",
+                   (unsigned long long)copied->seq,
+                   copied->reserved,
+                   (unsigned long)queued_len,
+                   frame.has_irap,
+                   used_cached_gop,
+                   (unsigned long long)g_h265_snapshot_cache.current_gop_start_seq,
+                   (unsigned long long)g_h265_snapshot_cache.current_gop_last_seq,
+                   g_h265_snapshot_cache.vps.len > 0,
+                   g_h265_snapshot_cache.sps.len > 0,
+                   g_h265_snapshot_cache.pps.len > 0);
+        }
+    }
+
+    free(out.data);
+    free(frame.au.data);
+    printf("[snapshot] copied seq=%llu done ret=%d\n",
+           (unsigned long long)copied->seq,
            ret);
     return ret;
 }
